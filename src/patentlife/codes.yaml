@@ -1,0 +1,35 @@
+# USPTO maintenance-fee event code -> state effect.
+#
+# This file is deliberately editable. It starts from prefix rules that are
+# safe, then lists specific codes as they are confirmed against USPTO's
+# official code list. Run `patentlife codes` against a downloaded events
+# file to list every code actually present with counts, so you can see what
+# is still unmapped before trusting any output.
+#
+# state effects:
+#   FEE_PAID     - a maintenance fee was paid; keeps the patent in force
+#   EXPIRED      - patent expired, in this file always for non-payment
+#   REINSTATED   - patent revived after expiry (surcharge / petition granted)
+#   NEUTRAL      - administrative, no effect on in-force state
+#   UNKNOWN      - not yet classified; treated as NEUTRAL but reported
+
+# Prefix rules apply when no exact code matches. Longest prefix wins.
+prefixes:
+  "EXP": EXPIRED        # EXP., EXPX and related expiry events
+  "M":   FEE_PAID       # M1551, M1552, M2553 ... payment of maintenance fee
+  "RMPN": REINSTATED    # reinstatement / revival
+  "PMFP": NEUTRAL       # petition for maintenance fee payment filed
+  "PMFG": REINSTATED    # petition granted
+  "LTOS": NEUTRAL       # notice of expiry / status letters
+  "FP":  NEUTRAL
+
+# Exact codes override prefixes. Add entries here as you confirm them
+# against USPTO's published maintenance fee code documentation.
+codes:
+  "EXP.": EXPIRED
+  "EXPX": EXPIRED
+  "STOL": NEUTRAL
+
+# Codes seen in the wild that we know we have NOT classified. `patentlife
+# codes` appends here so unmapped codes are visible rather than silent.
+unclassified: []

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "patentlife"
-version = "0.1.0"
+version = "0.2.0"
 description = "Which patents a company still holds, where, and until when — from public data."
 readme = "README.md"
 requires-python = ">=3.10"

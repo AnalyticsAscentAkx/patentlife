@@ -15,7 +15,7 @@
 
 # Prefix rules apply when no exact code matches. Longest prefix wins.
 prefixes:
-  "EXP": EXPIRED        # EXP., EXPX and related expiry events
+  "EXP": EXPIRED        # EXP. and related expiry events; EXPX is overridden below
   "M":   FEE_PAID       # M1551, M1552, M2553 ... payment of maintenance fee
   "RMPN": REINSTATED    # reinstatement / revival
   "PMFP": NEUTRAL       # petition for maintenance fee payment filed
@@ -27,8 +27,43 @@ prefixes:
 # against USPTO's published maintenance fee code documentation.
 codes:
   "EXP.": EXPIRED
-  "EXPX": EXPIRED
+  # EXPX is "expiration cancelled", not an expiry. It is emitted when a
+  # lapsed patent is reinstated, and it always follows the EXP. it undoes.
+  # Mapping it to EXPIRED - as this file previously did - left every revived
+  # patent reported as dead. Confirmed against matusfaro/invented, whose
+  # pipeline treats an EXPX newer than the EXP. as cancelling it.
+  "EXPX": REINSTATED
   "STOL": NEUTRAL
+
+# Which maintenance-fee window a payment code settles, in years from grant.
+# USPTO fees fall due at 3.5, 7.5 and 11.5 years, each with a six-month grace
+# period ending at 4, 8 and 12 years - which is what these stage numbers name.
+#
+# These three code families are corroborated by three independent
+# implementations that agree exactly: iamlemec/fastpat, aniemerg/Patent-Tools
+# and youngstone/Hunting4Patents.
+fee_stage:
+  M1551: 4
+  M170: 4
+  M173: 4
+  M183: 4
+  M2551: 4
+  M273: 4
+  M283: 4
+  M1552: 8
+  M171: 8
+  M174: 8
+  M184: 8
+  M2552: 8
+  M274: 8
+  M284: 8
+  M1553: 12
+  M172: 12
+  M175: 12
+  M185: 12
+  M2553: 12
+  M275: 12
+  M285: 12
 
 # Codes seen in the wild that we know we have NOT classified. `patentlife
 # codes` appends here so unmapped codes are visible rather than silent.

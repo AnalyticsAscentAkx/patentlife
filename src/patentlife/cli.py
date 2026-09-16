@@ -22,15 +22,39 @@ import urllib.request
 from . import assignee, maintfee
 from .status import CodeMap, derive
 
-# USPTO retired bulkdata.uspto.gov. The file now lives behind the Open Data
-# Portal API, which requires a free API key: register at https://data.uspto.gov
-# then set USPTO_API_KEY (or pass --api-key). The dataset landing page is
-# https://data.uspto.gov/bulkdata/datasets/ptmnfee2 - its download links work
-# in a browser, so a manual download is always a valid fallback.
+# USPTO retired bulkdata.uspto.gov. The file now lives on the Open Data
+# Portal. Two routes exist and neither is scriptable without credentials:
+#
+#   1. data.uspto.gov is a JavaScript app. Its HTML carries no dataset list -
+#      the list and every download link are fetched at runtime from
+#      api.uspto.gov, which answers {"message":"Unauthorized"} without an
+#      X-API-KEY. So curl and this command both get an empty shell. Signed
+#      into a USPTO.gov account in a real browser, the page works.
+#   2. patents.reedtech.com has mirrored the same zip for years and needs no
+#      USPTO account. It sits behind a Cloudflare challenge, so scripted
+#      requests get HTTP 403 while a real browser is served normally.
+#
+# Either way the practical answer is a one-off manual download; every other
+# command takes the .zip directly, so nothing needs unpacking.
 PRODUCT_ID = "ptmnfee2"
 PRODUCT_URL = f"https://api.uspto.gov/api/v1/datasets/products/{PRODUCT_ID}"
 REGISTER_URL = "https://data.uspto.gov/apis/getting-started"
 LANDING_URL = f"https://data.uspto.gov/bulkdata/datasets/{PRODUCT_ID}"
+MIRROR_URL = (
+    "https://patents.reedtech.com/downloads/PatentMaintFeeEvents/"
+    "1981-present/MaintFeeEvents.zip"
+)
+
+MANUAL_INSTRUCTIONS = f"""Download the file by hand, once:
+
+  USPTO Open Data Portal (needs a free USPTO.gov account):
+    {LANDING_URL}
+  or the Reed Tech mirror (no account, browser only):
+    {MIRROR_URL}
+
+Then point the other commands straight at the .zip - it is read in place:
+    patentlife inspect MaintFeeEvents.zip --ruler
+    patentlife status  MaintFeeEvents.zip -o status.csv"""
 
 DISCLAIMER = (
     "Derived from USPTO public-domain bulk data. Statutory term only: Patent "
@@ -64,12 +88,12 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     api_key = args.api_key or os.environ.get("USPTO_API_KEY")
     if not api_key:
         print(
-            "no API key. USPTO retired the old anonymous bulk-data host; the\n"
-            "maintenance fee file is now behind the Open Data Portal API.\n"
-            f"  1. get a free key: {REGISTER_URL}\n"
-            "  2. export USPTO_API_KEY=... (or pass --api-key)\n"
-            f"Or download it by hand in a browser from {LANDING_URL}\n"
-            "and point the other commands at the file directly.",
+            "no API key, so there is nothing this command can download.\n"
+            "USPTO retired the anonymous bulk-data host; the events file is\n"
+            "now behind the Open Data Portal API, whose keys require a\n"
+            f"USPTO.gov account with a verified identity: {REGISTER_URL}\n"
+            "Set USPTO_API_KEY (or pass --api-key) once you have one.\n\n"
+            f"{MANUAL_INSTRUCTIONS}",
             file=sys.stderr,
         )
         return 2
@@ -91,7 +115,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     urls = _zip_urls(product)
     if not urls:
         print(
-            f"no .zip download link in the product metadata. Download by hand from {LANDING_URL}",
+            "no .zip download link in the product metadata.\n\n"
+            f"{MANUAL_INSTRUCTIONS}",
             file=sys.stderr,
         )
         return 1
@@ -105,7 +130,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             shutil.copyfileobj(response, fh)
     except Exception as exc:  # noqa: BLE001 - surface the real reason
         print(
-            f"download failed: {exc}\nFetch it manually from {LANDING_URL}",
+            f"download failed: {exc}\n\n{MANUAL_INSTRUCTIONS}",
             file=sys.stderr,
         )
         return 1
@@ -131,6 +156,30 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     trusted. Read it field by field against the raw line above it.
     """
     path = pathlib.Path(args.file)
+    sample = maintfee._sample_lines(path)  # noqa: SLF001 - intentional, same package
+    if not sample:
+        print(f"{path} has no non-blank lines", file=sys.stderr)
+        return 1
+
+    # Score every known layout, so a file that fits neither is visible as a
+    # pair of low numbers rather than as silently wrong fields.
+    print("layout fit on the first "
+          f"{len(sample)} lines (patent number, event code and event date "
+          "all valid):", file=sys.stderr)
+    for name, candidate in maintfee.LAYOUTS.items():
+        print(f"  {name:<8} {maintfee.score_layout(sample, candidate):>6.1%}", file=sys.stderr)
+
+    if args.layout:
+        name, layout = args.layout, maintfee.LAYOUTS[args.layout]
+        print(f"using layout {name!r} (forced)\n", file=sys.stderr)
+    else:
+        try:
+            name, layout, score = maintfee.detect_layout(sample)
+        except maintfee.LayoutError as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            return 1
+        print(f"using layout {name!r} ({score:.1%})\n", file=sys.stderr)
+
     shown = 0
     with maintfee._open(path) as fh:  # noqa: SLF001 - intentional, same package
         for line in fh:
@@ -140,19 +189,20 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                 print(maintfee.ruler(max(len(line.rstrip()), 60)))
             print(f"RAW   {line.rstrip()}")
             print(f"TOKEN {_fmt_event(maintfee.parse_line(line))}")
-            print(f"FIXED {_fmt_event(maintfee.parse_line_fixed(line))}\n")
+            print(f"FIXED {_fmt_event(maintfee.parse_line_fixed(line, layout))}\n")
             shown += 1
             if shown >= args.n:
                 break
 
     if not maintfee.LAYOUT_VERIFIED:
         print(
-            "NOTE: the fixed-width offsets in maintfee.LAYOUT have never been "
-            "checked against a real file.\n"
-            "Run with --ruler, read each field's start column off the ruler, "
-            "correct maintfee.LAYOUT,\n"
-            "then set LAYOUT_VERIFIED = True. Until then no output from this "
-            "tool should be relied on.",
+            "NOTE: these offsets come from USPTO's own layout document "
+            "(MaintFeeEventsFileDocumentation.doc, June 2018) and match two\n"
+            "independent implementations, but nobody on this project has yet "
+            "confirmed them against a real download.\n"
+            "Read each field above against the ruler. If they line up, set "
+            "maintfee.LAYOUT_VERIFIED = True.\n"
+            "If they do not, correct maintfee.LAYOUTS and re-run.",
             file=sys.stderr,
         )
     return 0
@@ -283,6 +333,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             "entity_status",
             "state",
             "expiry_estimated",
+            "lapse_date",
+            "effective_end",
+            "last_fee_stage",
+            "next_fee_due",
+            "fee_status",
             "last_event_code",
             "last_event_date",
             "fee_payments",
@@ -301,6 +356,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 r.entity_status or "",
                 r.state,
                 r.expiry_estimated or "",
+                r.lapse_date or "",
+                r.effective_end or "",
+                r.last_fee_stage or "",
+                r.next_fee_due or "",
+                r.fee_status or "",
                 r.last_event_code or "",
                 r.last_event_date or "",
                 r.fee_payments,
@@ -336,6 +396,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("file")
     p.add_argument("-n", type=int, default=5)
     p.add_argument("--ruler", action="store_true", help="print a column-position ruler")
+    p.add_argument(
+        "--layout",
+        choices=sorted(maintfee.LAYOUTS),
+        default=None,
+        help="force a column layout instead of detecting it",
+    )
     p.set_defaults(func=cmd_inspect)
 
     p = sub.add_parser("assignees", help="search a PatentsView assignee table for owners")

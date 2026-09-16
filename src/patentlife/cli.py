@@ -11,16 +11,26 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import json
+import os
 import pathlib
+import shutil
 import sys
+import urllib.error
 import urllib.request
 
 from . import maintfee
 from .status import CodeMap, derive
 
-# USPTO republishes this weekly, cumulative. If the URL moves, the dataset
-# landing page is https://data.uspto.gov/bulkdata/datasets/ptmnfee2
-EVENTS_URL = "https://bulkdata.uspto.gov/data/patent/maintenancefee/MaintFeeEvents.zip"
+# USPTO retired bulkdata.uspto.gov. The file now lives behind the Open Data
+# Portal API, which requires a free API key: register at https://data.uspto.gov
+# then set USPTO_API_KEY (or pass --api-key). The dataset landing page is
+# https://data.uspto.gov/bulkdata/datasets/ptmnfee2 - its download links work
+# in a browser, so a manual download is always a valid fallback.
+PRODUCT_ID = "ptmnfee2"
+PRODUCT_URL = f"https://api.uspto.gov/api/v1/datasets/products/{PRODUCT_ID}"
+REGISTER_URL = "https://data.uspto.gov/apis/getting-started"
+LANDING_URL = f"https://data.uspto.gov/bulkdata/datasets/{PRODUCT_ID}"
 
 DISCLAIMER = (
     "Derived from USPTO public-domain bulk data. Statutory term only: Patent "
@@ -30,15 +40,72 @@ DISCLAIMER = (
 )
 
 
+def _zip_urls(node: object) -> list[str]:
+    """Pull every .zip URL out of the product metadata, whatever it is nested in.
+
+    The ODP response shape is not contractually stable, so rather than depend on
+    one field name we walk the whole document and keep anything that looks like
+    a download link.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for value in node.values():
+            found.extend(_zip_urls(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_zip_urls(value))
+    elif isinstance(node, str) and node.startswith("http") and node.endswith(".zip"):
+        found.append(node)
+    return found
+
+
 def cmd_fetch(args: argparse.Namespace) -> int:
     dest = pathlib.Path(args.out)
-    print(f"downloading {EVENTS_URL}\n  -> {dest}", file=sys.stderr)
+    api_key = args.api_key or os.environ.get("USPTO_API_KEY")
+    if not api_key:
+        print(
+            "no API key. USPTO retired the old anonymous bulk-data host; the\n"
+            "maintenance fee file is now behind the Open Data Portal API.\n"
+            f"  1. get a free key: {REGISTER_URL}\n"
+            "  2. export USPTO_API_KEY=... (or pass --api-key)\n"
+            f"Or download it by hand in a browser from {LANDING_URL}\n"
+            "and point the other commands at the file directly.",
+            file=sys.stderr,
+        )
+        return 2
+
+    headers = {"X-API-KEY": api_key, "Accept": "application/json"}
+    print(f"looking up product {PRODUCT_ID}", file=sys.stderr)
     try:
-        urllib.request.urlretrieve(EVENTS_URL, dest)
+        request = urllib.request.Request(PRODUCT_URL, headers=headers)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            product = json.load(response)
+    except urllib.error.HTTPError as exc:
+        hint = " - check the key is valid and activated" if exc.code in (401, 403) else ""
+        print(f"product lookup failed: HTTP {exc.code} {exc.reason}{hint}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - surface the real reason
+        print(f"product lookup failed: {exc}", file=sys.stderr)
+        return 1
+
+    urls = _zip_urls(product)
+    if not urls:
+        print(
+            f"no .zip download link in the product metadata. Download by hand from {LANDING_URL}",
+            file=sys.stderr,
+        )
+        return 1
+    # Prefer the events file if the product carries several archives.
+    url = next((u for u in urls if "MaintFeeEvents" in u), urls[0])
+
+    print(f"downloading {url}\n  -> {dest}", file=sys.stderr)
+    try:
+        request = urllib.request.Request(url, headers={"X-API-KEY": api_key})
+        with urllib.request.urlopen(request, timeout=600) as response, dest.open("wb") as fh:
+            shutil.copyfileobj(response, fh)
     except Exception as exc:  # noqa: BLE001 - surface the real reason
         print(
-            f"download failed: {exc}\n"
-            f"Fetch it manually from https://data.uspto.gov/bulkdata/datasets/ptmnfee2",
+            f"download failed: {exc}\nFetch it manually from {LANDING_URL}",
             file=sys.stderr,
         )
         return 1
@@ -152,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("fetch", help="download the USPTO maintenance fee events file")
     p.add_argument("-o", "--out", default="MaintFeeEvents.zip")
+    p.add_argument("--api-key", default=None, help="USPTO ODP key; defaults to $USPTO_API_KEY")
     p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("inspect", help="show raw and parsed lines, to check the layout")

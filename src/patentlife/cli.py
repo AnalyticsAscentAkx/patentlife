@@ -19,7 +19,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from . import maintfee
+from . import assignee, maintfee
 from .status import CodeMap, derive
 
 # USPTO retired bulkdata.uspto.gov. The file now lives behind the Open Data
@@ -113,24 +113,134 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fmt_event(event) -> str:
+    if event is None:
+        return "<no parse>"
+    return (
+        f"patent={event.patent_number!r} app={event.application_number!r} "
+        f"filed={event.filing_date} granted={event.grant_date} "
+        f"entity={event.entity_status!r} code={event.event_code!r} "
+        f"event={event.event_date}"
+    )
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
+    """Show raw lines against both parsers, so the layout can be checked.
+
+    This is the command that decides whether anything downstream can be
+    trusted. Read it field by field against the raw line above it.
+    """
     path = pathlib.Path(args.file)
     shown = 0
     with maintfee._open(path) as fh:  # noqa: SLF001 - intentional, same package
         for line in fh:
             if not line.strip():
                 continue
-            parsed = maintfee.parse_line(line)
+            if args.ruler:
+                print(maintfee.ruler(max(len(line.rstrip()), 60)))
             print(f"RAW   {line.rstrip()}")
-            print(f"PARSE {parsed}\n")
+            print(f"TOKEN {_fmt_event(maintfee.parse_line(line))}")
+            print(f"FIXED {_fmt_event(maintfee.parse_line_fixed(line))}\n")
             shown += 1
             if shown >= args.n:
                 break
+
+    if not maintfee.LAYOUT_VERIFIED:
+        print(
+            "NOTE: the fixed-width offsets in maintfee.LAYOUT have never been "
+            "checked against a real file.\n"
+            "Run with --ruler, read each field's start column off the ruler, "
+            "correct maintfee.LAYOUT,\n"
+            "then set LAYOUT_VERIFIED = True. Until then no output from this "
+            "tool should be relied on.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_assignees(args: argparse.Namespace) -> int:
+    """Search a PatentsView assignee table for candidate owners."""
+    path = pathlib.Path(args.file)
+    try:
+        index = assignee.AssigneeIndex.build(assignee.iter_assignees(path))
+    except ValueError as exc:
+        print(f"could not read {path.name}: {exc}", file=sys.stderr)
+        return 1
+
+    if not args.search:
+        print(f"{len(index.by_name)} distinct owners, {len(index.by_patent)} patents")
+        return 0
+
+    matches = index.search(
+        args.search, organisations_only=not args.include_individuals, limit=args.limit
+    )
+    if not matches:
+        print(f"no owner matching {args.search!r}", file=sys.stderr)
+        return 1
+
+    for match in matches:
+        variants = ", ".join(match.variants[:4])
+        if len(match.variants) > 4:
+            variants += f", +{len(match.variants) - 4} more"
+        print(f"{match.patent_count:>7}  {match.normalised}")
+        print(f"         spelled: {variants}")
     print(
-        "If PARSE lines look wrong, the USPTO layout has drifted; fix the "
-        "tokeniser in maintfee.parse_line.",
+        "\nThese are candidates, not an answer. Subsidiaries are listed "
+        "separately on purpose -\nwhether they belong in the portfolio is "
+        "your call. Pass the ones you want to `company`.",
         file=sys.stderr,
     )
+    return 0
+
+
+def cmd_company(args: argparse.Namespace) -> int:
+    """Join owner names against a status CSV to get one company's portfolio."""
+    index_path = pathlib.Path(args.file)
+    status_path = pathlib.Path(args.status)
+    try:
+        index = assignee.AssigneeIndex.build(assignee.iter_assignees(index_path))
+    except ValueError as exc:
+        print(f"could not read {index_path.name}: {exc}", file=sys.stderr)
+        return 1
+
+    wanted = index.patents_for(args.name)
+    if not wanted:
+        print(
+            f"no patents for {args.name!r}. Run `patentlife assignees "
+            f"{index_path.name} --search ...` to find the spelling in use.",
+            file=sys.stderr,
+        )
+        return 1
+
+    with status_path.open("rt", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None or "patent_number" not in reader.fieldnames:
+            print(f"{status_path.name} has no patent_number column", file=sys.stderr)
+            return 1
+        rows = [r for r in reader if r["patent_number"] in wanted]
+        fieldnames = list(reader.fieldnames)
+
+    if args.out:
+        with pathlib.Path(args.out).open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"{len(rows)} patents -> {args.out}", file=sys.stderr)
+    else:
+        counts = collections.Counter(r.get("state", "UNKNOWN") for r in rows)
+        for state, n in counts.most_common():
+            print(f"{n:>7}  {state}")
+
+    missing = len(wanted) - len(rows)
+    if missing > 0:
+        print(
+            f"note: {missing} of {len(wanted)} patents for this owner are absent "
+            f"from {status_path.name}.\nThe maintenance fee file only covers "
+            "patents that have reached a fee event, so pre-1981 grants and very "
+            "recent ones are expected to be missing.",
+            file=sys.stderr,
+        )
+    print(DISCLAIMER, file=sys.stderr)
     return 0
 
 
@@ -225,7 +335,22 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("inspect", help="show raw and parsed lines, to check the layout")
     p.add_argument("file")
     p.add_argument("-n", type=int, default=5)
+    p.add_argument("--ruler", action="store_true", help="print a column-position ruler")
     p.set_defaults(func=cmd_inspect)
+
+    p = sub.add_parser("assignees", help="search a PatentsView assignee table for owners")
+    p.add_argument("file", help="PatentsView assignee table (.tsv, .tsv.gz or .zip)")
+    p.add_argument("--search", default=None, help="company name to look for")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--include-individuals", action="store_true")
+    p.set_defaults(func=cmd_assignees)
+
+    p = sub.add_parser("company", help="one company's portfolio, with status")
+    p.add_argument("file", help="PatentsView assignee table")
+    p.add_argument("--name", action="append", required=True, help="repeatable")
+    p.add_argument("--status", required=True, help="CSV from `patentlife status`")
+    p.add_argument("-o", "--out", default=None)
+    p.set_defaults(func=cmd_company)
 
     p = sub.add_parser("codes", help="list event codes with counts and mapping")
     p.add_argument("file")

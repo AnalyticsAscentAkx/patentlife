@@ -116,6 +116,80 @@ def parse_line(line: str) -> MaintFeeEvent | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Fixed-width path.
+#
+# The file is fixed-width, so column slicing is the correct way to read it and
+# the whitespace tokeniser above is a fallback for when the layout drifts. The
+# offsets below are a STARTING GUESS and have never been checked against a real
+# file - see README "Accuracy". Do not trust output derived from them until
+# `patentlife inspect FILE --ruler` has been run on a real download and the
+# offsets read off the actual data.
+#
+# Offsets are 0-based [start, end) slices, matching Python.
+LAYOUT: dict[str, tuple[int, int]] = {
+    "patent_number": (0, 7),
+    "application_number": (8, 16),
+    "filing_date": (17, 25),
+    "grant_date": (26, 34),
+    "entity_status": (35, 38),
+    "event_code": (39, 45),
+    "event_date": (46, 54),
+}
+
+LAYOUT_VERIFIED = False  # flip to True only after checking against real lines
+
+
+def parse_line_fixed(
+    line: str, layout: dict[str, tuple[int, int]] | None = None
+) -> MaintFeeEvent | None:
+    """Parse one line by column offsets. Returns None if the slices don't fit.
+
+    Unlike the tokeniser this cannot silently shift fields when one is blank,
+    which is exactly the failure mode that would produce confident wrong
+    expiry dates. It fails loudly instead: a bad layout yields None, not
+    plausible-looking nonsense.
+    """
+    layout = layout or LAYOUT
+    stripped = line.rstrip("\r\n")
+    if not stripped.strip():
+        return None
+
+    def field(name: str) -> str:
+        start, end = layout[name]
+        return stripped[start:end].strip()
+
+    patent_number = field("patent_number").lstrip("0")
+    if not PATENT_RE.match(field("patent_number").strip() or "x"):
+        return None
+
+    code = field("event_code")
+    if not code:
+        return None
+
+    entity_raw = field("entity_status")
+    return MaintFeeEvent(
+        patent_number=patent_number,
+        application_number=field("application_number"),
+        filing_date=_parse_date(field("filing_date")),
+        grant_date=_parse_date(field("grant_date")),
+        entity_status=ENTITY_MAP.get(entity_raw, entity_raw or None),
+        event_code=code,
+        event_date=_parse_date(field("event_date")),
+    )
+
+
+def ruler(width: int = 90) -> str:
+    """A character-position ruler, to read column offsets off a real line.
+
+    Prints tens on the first row and units on the second, 0-based, so the
+    number under a field's first character is its slice start.
+    """
+    tens = "".join(str((i // 10) % 10) for i in range(width))
+    units = "".join(str(i % 10) for i in range(width))
+    return f"{tens}\n{units}"
+
+
 def iter_events(path: pathlib.Path) -> Iterator[MaintFeeEvent]:
     with _open(path) as fh:
         for line in fh:
